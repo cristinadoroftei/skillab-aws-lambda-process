@@ -1,0 +1,5 @@
+The MapReduce programming model is a framework for processing large datasets in parallel across a distributed cluster. It consists of two main phases: the Map phase, where input data is divided into independent chunks and processed in parallel, and the Reduce phase, where the results from the Map phase are combined to produce the final output.
+
+In the Map phase, each input record is processed by a mapper function that emits key-value pairs. The framework then groups these pairs by key, a process known as shuffling. The Reduce phase takes these grouped pairs and processes them with a reducer function to produce the final aggregated results.
+
+This model was popularized by Google in a 2004 paper and led to the development of open-source implementations like Apache Hadoop and later Apache Spark. While newer systems have largely superseded MapReduce for interactive workloads, the underlying concepts remain influential in modern distributed computing.

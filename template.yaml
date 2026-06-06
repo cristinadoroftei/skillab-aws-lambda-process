@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda chunking demo. Drop .txt files in s3://<bucket>/input/ and the
+  function writes JSON chunks to s3://<bucket>/output/.
+  Failed events end up in the DeadLetterQueue (SQS).
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique S3 bucket name (lowercase, no underscores)
+  ChunkSize:
+    Type: Number
+    Default: 500
+  ChunkOverlap:
+    Type: Number
+    Default: 50
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.12
+    Architectures: [arm64]
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDemoData
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # Dead Letter Queue: events that Lambda fails to process (after AWS retries)
+  # land here instead of being silently lost. Inspect from SQS console.
+  ChunkingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days (max allowed)
+
+  ChunkingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-chunker"
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          CHUNK_SIZE: !Ref ChunkSize
+          CHUNK_OVERLAP: !Ref ChunkOverlap
+          OUTPUT_BUCKET: !Ref BucketName
+          OUTPUT_PREFIX: "output/"
+      # When Lambda fails 3 times (initial + 2 retries) on an async event,
+      # the event is sent to this queue instead of being dropped.
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt ChunkingDLQ.Arn
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref BucketName
+        - S3WritePolicy:
+            BucketName: !Ref BucketName
+        # Lambda needs permission to write to its own DLQ
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ChunkingDLQ.QueueName
+      Events:
+        S3InputUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: input/
+                  - Name: suffix
+                    Value: .txt
+
+  # CloudWatch alarm that fires when there is at least 1 message in the DLQ.
+  # In a real setup you'd wire this to SNS -> email/Slack notification.
+  DLQNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-dlq-has-messages"
+      AlarmDescription: >
+        Triggers when a Lambda invocation has failed and the event ended up in the DLQ.
+        Inspect the queue to see what failed, fix the bug, then redrive the messages.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ChunkingDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  BucketName:
+    Description: S3 bucket holding input/ and output/ prefixes
+    Value: !Ref DataBucket
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref ChunkingFunction
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt ChunkingFunction.Arn
+  DLQUrl:
+    Description: URL of the Dead Letter Queue (for inspecting failed events)
+    Value: !Ref ChunkingDLQ
+  DLQName:
+    Description: Name of the Dead Letter Queue
+    Value: !GetAtt ChunkingDLQ.QueueName

@@ -1,0 +1,130 @@
+name: Deploy and Demo
+
+# Runs ONLY when you manually trigger it from the Actions tab.
+# Push to main does NOT auto-deploy anymore — you stay in control.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_smoke_test:
+        description: "Upload the 10 sample files after deploy?"
+        required: true
+        type: choice
+        options:
+          - "yes"
+          - "no"
+        default: "yes"
+
+env:
+  AWS_REGION: eu-central-1
+  STACK_NAME: lambda-chunking-demo
+  BUCKET_NAME: ${{ vars.BUCKET_NAME || 'lambda-chunking-demo-CHANGE-ME' }}
+
+jobs:
+  deploy:
+    name: Deploy SAM stack
+    runs-on: ubuntu-latest
+    outputs:
+      bucket: ${{ steps.outputs.outputs.bucket }}
+      function: ${{ steps.outputs.outputs.function }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: SAM build
+        run: sam build
+
+      - name: SAM deploy
+        run: |
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides "BucketName=$BUCKET_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Read stack outputs
+        id: outputs
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
+          FUNC=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='FunctionName'].OutputValue" --output text)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "function=$FUNC" >> "$GITHUB_OUTPUT"
+          echo "✅ Bucket: $BUCKET"
+          echo "✅ Function: $FUNC"
+
+  demo:
+    name: Upload 10 files and verify chunking
+    needs: deploy
+    # only run smoke test if the user asked for it
+    if: ${{ inputs.run_smoke_test == 'yes' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Clean previous demo output
+        run: |
+          aws s3 rm "s3://${{ needs.deploy.outputs.bucket }}/output/" --recursive || true
+          aws s3 rm "s3://${{ needs.deploy.outputs.bucket }}/input/" --recursive || true
+
+      - name: Upload sample files
+        run: |
+          aws s3 cp sample_files/ "s3://${{ needs.deploy.outputs.bucket }}/input/" \
+            --recursive --exclude "*" --include "*.txt"
+          echo "📤 Uploaded $(ls sample_files/*.txt | wc -l) files"
+
+      - name: Wait for Lambda to process all files
+        run: |
+          EXPECTED=$(ls sample_files/*.txt | wc -l)
+          echo "Waiting for $EXPECTED output files..."
+          for i in {1..30}; do
+            ACTUAL=$(aws s3 ls "s3://${{ needs.deploy.outputs.bucket }}/output/" 2>/dev/null | wc -l)
+            echo "  attempt $i: $ACTUAL / $EXPECTED outputs ready"
+            if [ "$ACTUAL" -ge "$EXPECTED" ]; then
+              echo "✅ All files processed"
+              break
+            fi
+            sleep 4
+          done
+
+      - name: Show chunking summary
+        run: |
+          echo "## 📊 Chunking results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | Original chars | Chunks |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|---------------:|-------:|" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p /tmp/output
+          aws s3 cp "s3://${{ needs.deploy.outputs.bucket }}/output/" /tmp/output/ --recursive
+          for f in /tmp/output/*.json; do
+            name=$(jq -r '.source_key' "$f")
+            orig=$(jq -r '.original_char_count' "$f")
+            chunks=$(jq -r '.chunk_count' "$f")
+            echo "| \`$name\` | $orig | $chunks |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload chunk JSONs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunked-output
+          path: /tmp/output/

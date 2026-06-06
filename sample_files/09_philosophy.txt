@@ -1,0 +1,5 @@
+The trolley problem is a thought experiment in ethics, first formulated in detail by philosopher Philippa Foot in 1967 and later expanded by Judith Jarvis Thomson. The basic scenario is straightforward: a runaway trolley is heading toward five people tied to the tracks. You are standing next to a lever that can divert the trolley onto a side track, where only one person is tied. Do you pull the lever?
+
+Most people answer yes — saving five lives at the cost of one seems intuitively right. But Thomson's variation complicates things. Imagine you are on a bridge above the tracks, and the only way to stop the trolley is to push a large stranger off the bridge onto the tracks. The math is identical: one death prevents five. Yet most people refuse to push.
+
+This asymmetry has driven decades of philosophical and psychological research. It has practical implications too: as autonomous vehicles become reality, programmers must make explicit choices that humans usually make instinctively, forcing us to confront these dilemmas with unprecedented clarity.

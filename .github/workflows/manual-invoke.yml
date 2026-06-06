@@ -1,0 +1,110 @@
+name: Manual Invoke Lambda
+
+# This workflow does NOT trigger the Lambda via S3 — it calls it directly
+# with `aws lambda invoke` using a custom payload. Useful for:
+#   - reprocessing existing files in the bucket
+#   - quick tests with inline text (no S3 needed)
+#   - on-demand processing without uploading new files
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to process"
+        required: true
+        type: choice
+        options:
+          - inline_text
+          - all_files_in_input_prefix
+          - specific_keys
+        default: all_files_in_input_prefix
+      inline_text:
+        description: "(inline_text mode) The text to chunk"
+        required: false
+        default: "This is a quick test. Lambda was invoked manually from GitHub Actions, with no S3 upload involved."
+      keys:
+        description: "(specific_keys mode) Comma-separated S3 keys, e.g. input/a.txt,input/b.txt"
+        required: false
+        default: "input/01_lorem.txt,input/02_short.txt"
+
+env:
+  AWS_REGION: eu-central-1
+  STACK_NAME: lambda-chunking-demo
+
+jobs:
+  invoke:
+    name: Invoke Lambda directly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Look up function name and bucket from stack
+        id: stack
+        run: |
+          FUNC=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='FunctionName'].OutputValue" --output text)
+          BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
+          echo "function=$FUNC" >> "$GITHUB_OUTPUT"
+          echo "bucket=$BUCKET"  >> "$GITHUB_OUTPUT"
+          echo "🎯 Function: $FUNC"
+          echo "📦 Bucket:   $BUCKET"
+
+      - name: Build payload
+        id: payload
+        run: |
+          case "${{ inputs.mode }}" in
+            inline_text)
+              jq -n --arg t "${{ inputs.inline_text }}" '{text: $t}' > payload.json
+              ;;
+            all_files_in_input_prefix)
+              jq -n --arg b "${{ steps.stack.outputs.bucket }}" \
+                '{bucket: $b, prefix: "input/"}' > payload.json
+              ;;
+            specific_keys)
+              # turn "a,b,c" into ["a","b","c"]
+              KEYS_JSON=$(echo "${{ inputs.keys }}" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+              jq -n --arg b "${{ steps.stack.outputs.bucket }}" --argjson k "$KEYS_JSON" \
+                '{bucket: $b, keys: $k}' > payload.json
+              ;;
+          esac
+          echo "📨 Payload sent to Lambda:"
+          cat payload.json
+
+      - name: Invoke Lambda synchronously
+        run: |
+          aws lambda invoke \
+            --function-name "${{ steps.stack.outputs.function }}" \
+            --cli-binary-format raw-in-base64-out \
+            --payload file://payload.json \
+            --log-type Tail \
+            response.json > invoke-meta.json
+
+          echo "::group::Lambda response"
+          jq . response.json
+          echo "::endgroup::"
+
+          echo "::group::Last 4KB of CloudWatch logs"
+          jq -r '.LogResult' invoke-meta.json | base64 -d
+          echo "::endgroup::"
+
+      - name: Write summary
+        run: |
+          {
+            echo "## 🎯 Manual Lambda invoke result"
+            echo ""
+            echo "**Mode:** \`${{ inputs.mode }}\`"
+            echo "**Function:** \`${{ steps.stack.outputs.function }}\`"
+            echo ""
+            echo "### Response"
+            echo '```json'
+            jq . response.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

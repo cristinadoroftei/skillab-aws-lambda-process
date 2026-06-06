@@ -1,0 +1,161 @@
+name: Destroy Stack
+
+# Tears down EVERYTHING this demo created in AWS:
+#   - empties the S3 bucket (CloudFormation refuses to delete a non-empty one)
+#   - purges the DLQ (just to be tidy; the queue itself is deleted with the stack)
+#   - deletes the CloudFormation stack (Lambda, bucket, IAM role, event notification,
+#     lifecycle, DLQ, CloudWatch alarm)
+#
+# NOTE: SAM's own artifact bucket (named "aws-sam-cli-managed-default-...") is in a
+# SEPARATE stack and is NOT deleted by this workflow. It's harmless and stays around
+# for future deploys. If you want to wipe it too, delete it manually from S3 console
+# (after first emptying it).
+#
+# Requires typing "DELETE" explicitly as a confirmation, so it can't fire by accident.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type DELETE (uppercase) to confirm. Anything else aborts.'
+        required: true
+        default: ''
+
+env:
+  AWS_REGION: eu-central-1
+  STACK_NAME: lambda-chunking-demo
+
+jobs:
+  destroy:
+    name: Destroy CloudFormation stack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation
+        run: |
+          if [ "${{ inputs.confirmation }}" != "DELETE" ]; then
+            echo "❌ Confirmation did not match. Expected exactly: DELETE"
+            echo "   You typed: '${{ inputs.confirmation }}'"
+            echo "Aborting — nothing was changed."
+            exit 1
+          fi
+          echo "✅ Confirmation matched. Proceeding with teardown."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check that the stack actually exists
+        id: check
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            echo "ℹ️  Stack '$STACK_NAME' does not exist. Nothing to do."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "📦 Stack '$STACK_NAME' found."
+
+      - name: Look up bucket and DLQ from stack outputs
+        if: steps.check.outputs.exists == 'true'
+        id: lookup
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+          DLQ_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='DLQUrl'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "⚠️  No bucket output found on stack. Will skip emptying."
+            echo "bucket=" >> "$GITHUB_OUTPUT"
+          else
+            echo "📦 Bucket to empty: $BUCKET"
+            echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -z "$DLQ_URL" ] || [ "$DLQ_URL" = "None" ]; then
+            echo "ℹ️  No DLQ output found (stack may pre-date DLQ feature). Skipping purge."
+            echo "dlq_url=" >> "$GITHUB_OUTPUT"
+          else
+            echo "📨 DLQ to purge: $DLQ_URL"
+            echo "dlq_url=$DLQ_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Empty the S3 bucket
+        if: steps.lookup.outputs.bucket != ''
+        run: |
+          set +e  # Don't exit on errors - we handle them manually
+          BUCKET="${{ steps.lookup.outputs.bucket }}"
+          echo "🧹 Emptying s3://$BUCKET ..."
+
+          # Remove all current objects
+          aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null
+
+          # Remove any non-current versions (if versioning was ever enabled)
+          VERSIONS=$(aws s3api list-object-versions --bucket "$BUCKET" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null | jq -c 'select(.Objects != null and .Objects != [])')
+          if [ -n "$VERSIONS" ]; then
+            echo "$VERSIONS" | aws s3api delete-objects --bucket "$BUCKET" --delete file:///dev/stdin 2>/dev/null
+          fi
+
+          # Remove delete markers
+          MARKERS=$(aws s3api list-object-versions --bucket "$BUCKET" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null | jq -c 'select(.Objects != null and .Objects != [])')
+          if [ -n "$MARKERS" ]; then
+            echo "$MARKERS" | aws s3api delete-objects --bucket "$BUCKET" --delete file:///dev/stdin 2>/dev/null
+          fi
+
+          echo "✅ Bucket emptied."
+
+      - name: Purge the DLQ
+        if: steps.lookup.outputs.dlq_url != ''
+        run: |
+          DLQ_URL="${{ steps.lookup.outputs.dlq_url }}"
+          echo "🧹 Purging DLQ: $DLQ_URL"
+          # PurgeQueue can only be called once per 60s, so we ignore failures —
+          # the queue is deleted with the stack anyway.
+          aws sqs purge-queue --queue-url "$DLQ_URL" 2>/dev/null \
+            && echo "✅ DLQ purged." \
+            || echo "ℹ️  DLQ purge skipped (recently purged or empty). Queue will be deleted with stack."
+
+      - name: Delete the CloudFormation stack
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "🔥 Deleting stack '$STACK_NAME' ..."
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+          echo "⏳ Waiting for delete to complete (1-3 minutes)..."
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          echo "✅ Stack deleted."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 🔥 Destroy result"
+            echo ""
+            if [ "${{ steps.check.outputs.exists }}" = "false" ]; then
+              echo "Stack \`$STACK_NAME\` did not exist. Nothing was changed."
+            else
+              echo "Stack \`$STACK_NAME\` was deleted, including:"
+              echo "- ⚡ Lambda function"
+              echo "- 📦 S3 bucket (\`${{ steps.lookup.outputs.bucket }}\`) and all its contents"
+              echo "- 🔐 IAM role for Lambda"
+              echo "- 🔔 S3 event notification"
+              echo "- 📨 SQS Dead Letter Queue"
+              echo "- 🚨 CloudWatch alarm"
+              echo "- 🗓️ S3 lifecycle rule"
+              echo ""
+              echo "### ℹ️  Not deleted (intentionally)"
+              echo "SAM's artifact bucket (\`aws-sam-cli-managed-default-...\`) is in a"
+              echo "separate stack and remains. It costs ~\$0/month and is reused on next deploy."
+              echo "Delete it manually from S3 console if you want a 100% clean account."
+              echo ""
+              echo "💡 You can recreate everything any time from Actions → 'Deploy and Demo' → Run workflow."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,5 @@
+Vector embeddings are numerical representations of data — typically text, images, or audio — that capture semantic meaning in a high-dimensional space. In natural language processing, embeddings transform words, sentences, or documents into dense vectors, usually of 256 to 1536 dimensions, such that semantically similar items are positioned close to each other in that space.
+
+Modern embedding models are typically derived from transformer architectures. The training process involves exposing the model to massive amounts of text and adjusting the parameters so that the resulting vectors reflect linguistic relationships. The cosine similarity between two vectors then becomes a useful proxy for semantic similarity between the original inputs.
+
+Embeddings are the backbone of retrieval-augmented generation (RAG) systems. A typical RAG pipeline chunks source documents into manageable pieces, embeds each chunk, and stores them in a vector database. At query time, the user's question is embedded with the same model and the most similar chunks are retrieved and passed to an LLM as context.
